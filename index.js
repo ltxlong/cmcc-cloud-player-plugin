@@ -2,7 +2,7 @@
 // @name         中国移动云盘外置最高画质视频播放器
 // @namespace    cmcc-cloud-4k-player-plugin
 // @version      1.0.0
-// @description  捕获中国移动云盘 HLS master playlist，外置播放最高画质，支持 ArtPlayer / HTML5 切换、最小化隐藏与恢复
+// @description  捕获中国移动云盘 HLS master playlist，外置播放最高画质，支持 ArtPlayer / HTML5 / DPlayer 下拉选择、最小化隐藏与恢复
 // @match        *://*.139.com/*
 // @match        *://*.mcloud.139.com/*
 // @grant        GM_setClipboard
@@ -11,6 +11,7 @@
 // @grant        GM_setValue
 // @require      https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js
 // @require      https://cdn.jsdelivr.net/npm/artplayer@5.2.2/dist/artplayer.js
+// @require      https://cdn.jsdelivr.net/npm/dplayer@1.27.1/dist/DPlayer.min.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -19,7 +20,12 @@
 
   const PLAYER_HTML5 = 'html5';
   const PLAYER_ART = 'artplayer';
+  const PLAYER_DPLAYER = 'dplayer';
+  const PLAYER_OPTIONS = [PLAYER_HTML5, PLAYER_ART, PLAYER_DPLAYER];
   const STORAGE_KEY = 'cmcc4k_player_type';
+
+  const DPLAYER_CSS_ID = '__cmcc4k_dplayer_css__';
+  const DPLAYER_CSS_URL = 'https://cdn.jsdelivr.net/npm/dplayer@1.27.1/dist/DPlayer.min.css';
 
   const state = {
     masterUrl: '',
@@ -29,7 +35,9 @@
     buttonWrap: null,
     playButton: null,
     restoreButton: null,
+    switchBox: null,
     switchButton: null,
+    playerMenu: null,
 
     overlay: null,
     overlayContent: null,
@@ -39,11 +47,12 @@
     currentResolution: '',
     currentVideoName: '',
 
-    playerType: normalizePlayerType(safeGMGet(STORAGE_KEY, PLAYER_ART)),
+    playerType: normalizePlayerType(safeGMGet(STORAGE_KEY, PLAYER_HTML5)),
     renderedPlayerType: '',
 
     hls: null,
     art: null,
+    dp: null,
     video: null,
 
     isMinimized: false,
@@ -68,15 +77,27 @@
   }
 
   function normalizePlayerType(type) {
-    return type === PLAYER_HTML5 ? PLAYER_HTML5 : PLAYER_ART;
+    if (type === PLAYER_ART) return PLAYER_ART;
+    if (type === PLAYER_DPLAYER) return PLAYER_DPLAYER;
+    return PLAYER_HTML5;
   }
 
   function playerName(type = state.playerType) {
-    return type === PLAYER_HTML5 ? 'HTML5' : 'ArtPlayer';
+    if (type === PLAYER_ART) return 'ArtPlayer';
+    if (type === PLAYER_DPLAYER) return 'DPlayer';
+    return 'HTML5';
   }
 
   function normalizeText(text) {
     return (text || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function toAbsoluteUrl(url, base) {
+    try {
+      return new URL(url, base || location.href).href;
+    } catch (e) {
+      return url || '';
+    }
   }
 
   function toast(msg) {
@@ -97,14 +118,33 @@
   function appendToBodyWhenReady(node) {
     const mount = () => {
       if (document.body) {
-        if (!node.isConnected) {
-          document.body.appendChild(node);
-        }
+        if (!node.isConnected) document.body.appendChild(node);
       } else {
         setTimeout(mount, 200);
       }
     };
     mount();
+  }
+
+  function ensureDPlayerCss() {
+    if (document.getElementById(DPLAYER_CSS_ID)) return;
+
+    const inject = () => {
+      const head = document.head || document.documentElement;
+      if (!head) {
+        setTimeout(inject, 200);
+        return;
+      }
+      if (document.getElementById(DPLAYER_CSS_ID)) return;
+
+      const link = document.createElement('link');
+      link.id = DPLAYER_CSS_ID;
+      link.rel = 'stylesheet';
+      link.href = DPLAYER_CSS_URL;
+      head.appendChild(link);
+    };
+
+    inject();
   }
 
   function formatVariantShort(v) {
@@ -150,6 +190,36 @@
     return parts.join(' | ') || '播放器';
   }
 
+  function setVideoVolumeToMax(video) {
+    try {
+      if (!video) return;
+      video.muted = false;
+      video.volume = 1;
+    } catch (e) {}
+  }
+
+  function setArtVolumeToMax(art) {
+    try {
+      if (!art) return;
+      art.volume = 1;
+    } catch (e) {}
+    try {
+      setVideoVolumeToMax(art.video);
+    } catch (e) {}
+  }
+
+  function setDPlayerVolumeToMax(dp) {
+    try {
+      if (!dp) return;
+      if (typeof dp.volume === 'function') {
+        dp.volume(1, true, true);
+      }
+    } catch (e) {}
+    try {
+      setVideoVolumeToMax(dp.video);
+    } catch (e) {}
+  }
+
   GM_addStyle(`
     #__cmcc4k_btns__ {
       position: fixed;
@@ -191,6 +261,62 @@
 
     .__cmcc4k_btn__:hover {
       filter: brightness(1.05);
+    }
+
+    .__cmcc4k_switch_box__ {
+      position: relative;
+      width: 240px;
+    }
+
+    .__cmcc4k_switch_box__ > .__cmcc4k_btn__ {
+      width: 100%;
+    }
+
+    .__cmcc4k_menu__ {
+      position: absolute;
+      right: 0;
+      bottom: calc(100% + 8px);
+      width: 100%;
+      display: none;
+      flex-direction: column;
+      background: rgba(25,25,25,.98);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 8px 20px rgba(0,0,0,.35);
+      backdrop-filter: blur(4px);
+    }
+
+    .__cmcc4k_menu__[data-open="1"] {
+      display: flex;
+    }
+
+    .__cmcc4k_menu_item__ {
+      border: 0;
+      background: transparent;
+      color: #fff;
+      padding: 10px 14px;
+      font-size: 14px;
+      cursor: pointer;
+      width: 100%;
+      text-align: center;
+      box-sizing: border-box;
+    }
+
+    .__cmcc4k_menu_item__ + .__cmcc4k_menu_item__ {
+      border-top: 1px solid rgba(255,255,255,.08);
+    }
+
+    .__cmcc4k_menu_item__:hover {
+      background: rgba(255,255,255,.08);
+    }
+
+    .__cmcc4k_menu_item__.current {
+      background: #52c41a;
+      font-weight: 600;
+    }
+
+    .__cmcc4k_menu_item__.current:hover {
+      background: #52c41a;
     }
 
     #__cmcc4k_toast__ {
@@ -246,7 +372,7 @@
         variants.push({
           info,
           rawUri: uri,
-          url: new URL(uri, masterUrl).href,
+          url: toAbsoluteUrl(uri, masterUrl),
           width,
           height,
           bandwidth,
@@ -295,7 +421,7 @@
 
         if (/\.m3u8(\?|$)|playlist\.m3u8/i.test(reqUrl)) {
           const text = await resp.clone().text();
-          saveMaster(reqUrl, text);
+          saveMaster(toAbsoluteUrl(reqUrl, location.href), text);
         }
       } catch (e) {
         log('fetch hook error:', e);
@@ -322,7 +448,7 @@
 
           if (/\.m3u8(\?|$)|playlist\.m3u8/i.test(url) || /mpegurl/i.test(ct)) {
             if (typeof this.responseText === 'string') {
-              saveMaster(url, this.responseText);
+              saveMaster(toAbsoluteUrl(url, location.href), this.responseText);
             }
           }
         } catch (e) {
@@ -334,6 +460,41 @@
     };
   }
 
+  function isPlayerMenuOpen() {
+    return !!(state.playerMenu && state.playerMenu.dataset.open === '1');
+  }
+
+  function setPlayerMenuVisible(visible) {
+    if (!state.playerMenu) return;
+    state.playerMenu.dataset.open = visible ? '1' : '0';
+  }
+
+  function closePlayerMenu() {
+    setPlayerMenuVisible(false);
+  }
+
+  function togglePlayerMenu(event) {
+    if (event) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    setPlayerMenuVisible(!isPlayerMenuOpen());
+  }
+
+  function createPlayerMenuItem(type) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = '__cmcc4k_menu_item__';
+    btn.dataset.playerType = type;
+    btn.textContent = playerName(type);
+    btn.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setPlayerType(type);
+    };
+    return btn;
+  }
+
   function ensureButtons() {
     if (state.buttonWrap && state.buttonWrap.isConnected) {
       updateButtons();
@@ -343,23 +504,28 @@
     state.buttonWrap = null;
     state.playButton = null;
     state.restoreButton = null;
+    state.switchBox = null;
     state.switchButton = null;
+    state.playerMenu = null;
 
     const wrap = document.createElement('div');
     wrap.id = '__cmcc4k_btns__';
 
     const playBtn = document.createElement('button');
+    playBtn.type = 'button';
     playBtn.className = '__cmcc4k_btn__';
     playBtn.textContent = '播放最高画质';
     playBtn.onclick = openBest;
 
     const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
     restoreBtn.className = '__cmcc4k_btn__ restore';
     restoreBtn.textContent = '恢复显示播放器弹窗';
     restoreBtn.style.display = 'none';
     restoreBtn.onclick = restoreOverlay;
 
     const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
     copyBtn.className = '__cmcc4k_btn__ secondary';
     copyBtn.textContent = '复制最高画质地址';
     copyBtn.onclick = () => {
@@ -372,20 +538,37 @@
       toast('已复制最高画质地址');
     };
 
+    const switchBox = document.createElement('div');
+    switchBox.className = '__cmcc4k_switch_box__';
+
     const switchBtn = document.createElement('button');
+    switchBtn.type = 'button';
     switchBtn.className = '__cmcc4k_btn__ secondary';
     switchBtn.textContent = `选择播放器：${playerName()}`;
-    switchBtn.onclick = togglePlayerType;
+    switchBtn.onclick = togglePlayerMenu;
+
+    const menu = document.createElement('div');
+    menu.className = '__cmcc4k_menu__';
+    menu.dataset.open = '0';
+
+    PLAYER_OPTIONS.forEach(type => {
+      menu.appendChild(createPlayerMenuItem(type));
+    });
+
+    switchBox.appendChild(switchBtn);
+    switchBox.appendChild(menu);
 
     wrap.appendChild(playBtn);
     wrap.appendChild(restoreBtn);
     wrap.appendChild(copyBtn);
-    wrap.appendChild(switchBtn);
+    wrap.appendChild(switchBox);
 
     state.buttonWrap = wrap;
     state.playButton = playBtn;
     state.restoreButton = restoreBtn;
+    state.switchBox = switchBox;
     state.switchButton = switchBtn;
+    state.playerMenu = menu;
 
     appendToBodyWhenReady(wrap);
     updateButtons();
@@ -410,12 +593,30 @@
       state.switchButton.textContent = `选择播放器：${playerName()}`;
     }
 
+    if (state.playerMenu) {
+      const items = state.playerMenu.querySelectorAll('.__cmcc4k_menu_item__');
+      items.forEach(item => {
+        const type = item.dataset.playerType || '';
+        item.classList.toggle('current', type === state.playerType);
+        item.textContent = playerName(type);
+      });
+    }
+
     updateRestoreButton();
     updateOverlayTitle();
   }
 
   function setPlayerType(type) {
-    state.playerType = normalizePlayerType(type);
+    const nextType = normalizePlayerType(type);
+    closePlayerMenu();
+
+    if (state.playerType === nextType) {
+      updateButtons();
+      toast(`当前播放器：${playerName()}`);
+      return;
+    }
+
+    state.playerType = nextType;
     safeGMSet(STORAGE_KEY, state.playerType);
     updateButtons();
 
@@ -426,11 +627,6 @@
     }
 
     toast(`当前播放器：${playerName()}`);
-  }
-
-  function togglePlayerType() {
-    const next = state.playerType === PLAYER_ART ? PLAYER_HTML5 : PLAYER_ART;
-    setPlayerType(next);
   }
 
   function ensureOverlayShell() {
@@ -480,6 +676,7 @@
     `;
 
     const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
     copyBtn.textContent = '复制播放地址';
     copyBtn.style.cssText = `
       border:0;background:#333;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;
@@ -494,6 +691,7 @@
     };
 
     const miniBtn = document.createElement('button');
+    miniBtn.type = 'button';
     miniBtn.textContent = '最小化';
     miniBtn.style.cssText = `
       border:0;background:#faad14;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;
@@ -501,6 +699,7 @@
     miniBtn.onclick = minimizeOverlay;
 
     const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
     closeBtn.textContent = '关闭';
     closeBtn.style.cssText = `
       border:0;background:#ff4d4f;color:#fff;padding:6px 10px;border-radius:6px;cursor:pointer;
@@ -534,7 +733,6 @@
 
   function updateOverlayTitle() {
     refreshCurrentVideoName(false);
-
     if (!state.overlayTitleEl) return;
     state.overlayTitleEl.textContent = buildOverlayTitleText();
   }
@@ -568,15 +766,20 @@
     } catch (e) {}
 
     try {
-      if (state.video) {
-        state.video.pause();
+      if (state.dp && typeof state.dp.pause === 'function') {
+        state.dp.pause();
+        return;
       }
+    } catch (e) {}
+
+    try {
+      if (state.video) state.video.pause();
     } catch (e) {}
   }
 
   function showOverlay() {
     if (!state.overlay) return;
-
+    closePlayerMenu();
     pausePagePlayerIfPlaying();
     state.overlay.style.display = 'flex';
     state.isMinimized = false;
@@ -615,14 +818,15 @@
 
   function clearPlayerInstances() {
     const artHls = state.art && state.art.__cmccHls__ ? state.art.__cmccHls__ : null;
+    const dpHls = state.dp && state.dp.__cmccHls__ ? state.dp.__cmccHls__ : null;
 
-    if (artHls) {
-      destroyHlsInstance(artHls);
-    }
+    try {
+      if (state.video) state.video.pause();
+    } catch (e) {}
 
-    if (state.hls && state.hls !== artHls) {
-      destroyHlsInstance(state.hls);
-    }
+    if (artHls) destroyHlsInstance(artHls);
+    if (dpHls && dpHls !== artHls) destroyHlsInstance(dpHls);
+    if (state.hls && state.hls !== artHls && state.hls !== dpHls) destroyHlsInstance(state.hls);
 
     state.hls = null;
 
@@ -633,9 +837,15 @@
       state.art = null;
     }
 
+    if (state.dp) {
+      try {
+        state.dp.destroy();
+      } catch (e) {}
+      state.dp = null;
+    }
+
     if (state.video) {
       try {
-        state.video.pause();
         state.video.removeAttribute('src');
         state.video.load();
       } catch (e) {}
@@ -651,6 +861,7 @@
 
   function removeOverlay() {
     clearPlayerInstances();
+    closePlayerMenu();
 
     if (state.overlay) {
       try {
@@ -685,10 +896,12 @@
 
     clearPlayerInstances();
 
-    if (state.playerType === PLAYER_HTML5) {
-      renderHTML5Player(state.overlayContent, state.currentPlayUrl);
-    } else {
+    if (state.playerType === PLAYER_ART) {
       renderArtPlayer(state.overlayContent, state.currentPlayUrl);
+    } else if (state.playerType === PLAYER_DPLAYER) {
+      renderDPlayer(state.overlayContent, state.currentPlayUrl);
+    } else {
+      renderHTML5Player(state.overlayContent, state.currentPlayUrl);
     }
 
     state.renderedPlayerType = state.playerType;
@@ -701,6 +914,7 @@
     video.autoplay = true;
     video.playsInline = true;
     video.preload = 'auto';
+    video.volume = 1;
     video.style.cssText = `
       width: 100%;
       height: 100%;
@@ -710,6 +924,7 @@
 
     container.appendChild(video);
     state.video = video;
+    setVideoVolumeToMax(video);
 
     if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = playUrl;
@@ -729,6 +944,7 @@
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        setVideoVolumeToMax(video);
         video.play().catch(() => {});
       });
 
@@ -775,6 +991,7 @@
       hotkey: true,
       mutex: true,
       theme: '#1677ff',
+      volume: 1,
       moreVideoAttr: {
         playsinline: true,
         'webkit-playsinline': 'true',
@@ -783,6 +1000,8 @@
       },
       customType: {
         m3u8(video, url, artInstance) {
+          setVideoVolumeToMax(video);
+
           if (video.canPlayType('application/vnd.apple.mpegurl')) {
             video.src = url;
             return;
@@ -801,6 +1020,10 @@
             hls.loadSource(url);
             hls.attachMedia(video);
 
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              setVideoVolumeToMax(video);
+            });
+
             hls.on(Hls.Events.ERROR, (event, data) => {
               console.warn('[CMCC-4K] ArtPlayer HLS error:', data);
             });
@@ -813,7 +1036,93 @@
     });
 
     state.art = art;
-    state.video = art.video || null;
+    state.video = art.video || host.querySelector('video') || null;
+    setArtVolumeToMax(art);
+    setTimeout(() => setArtVolumeToMax(art), 200);
+  }
+
+  function renderDPlayer(container, playUrl) {
+    ensureDPlayerCss();
+
+    if (!window.DPlayer) {
+      toast('DPlayer 未加载，已回退到 HTML5');
+      state.playerType = PLAYER_HTML5;
+      safeGMSet(STORAGE_KEY, state.playerType);
+      updateButtons();
+      renderHTML5Player(container, playUrl);
+      return;
+    }
+
+    const host = document.createElement('div');
+    host.style.cssText = `
+      width: 100%;
+      height: 100%;
+      background: #000;
+    `;
+    container.appendChild(host);
+
+    const dp = new window.DPlayer({
+      container: host,
+      autoplay: true,
+      hotkey: true,
+      screenshot: false,
+      airplay: true,
+      theme: '#1677ff',
+      preload: 'auto',
+      volume: 1,
+      mutex: true,
+      playbackSpeed: [0.5, 0.75, 1, 1.25, 1.5, 2],
+      video: {
+        url: playUrl,
+        type: 'customHls',
+        customType: {
+          customHls(video, player) {
+            setVideoVolumeToMax(video);
+
+            const sourceUrl =
+              video.src ||
+              (player && player.options && player.options.video && player.options.video.url) ||
+              playUrl;
+
+            if (video.canPlayType('application/vnd.apple.mpegurl')) {
+              video.src = sourceUrl;
+              return;
+            }
+
+            if (window.Hls && Hls.isSupported()) {
+              const hls = new Hls({
+                enableWorker: true,
+                lowLatencyMode: false,
+                capLevelToPlayerSize: false,
+              });
+
+              player.__cmccHls__ = hls;
+              state.hls = hls;
+
+              hls.loadSource(sourceUrl);
+              hls.attachMedia(video);
+
+              hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                setVideoVolumeToMax(video);
+                video.play().catch(() => {});
+              });
+
+              hls.on(Hls.Events.ERROR, (event, data) => {
+                console.warn('[CMCC-4K] DPlayer HLS error:', data);
+              });
+              return;
+            }
+
+            toast('当前浏览器不支持 HLS 播放');
+          },
+        },
+      },
+    });
+
+    state.dp = dp;
+    state.video = dp.video || host.querySelector('video') || null;
+    setDPlayerVolumeToMax(dp);
+    setTimeout(() => setDPlayerVolumeToMax(dp), 200);
   }
 
   function openBest() {
@@ -891,11 +1200,26 @@
   hookFetch();
   hookXHR();
   ensureButtons();
+  ensureDPlayerCss();
   observePageTitle();
 
+  document.addEventListener('click', (e) => {
+    if (!isPlayerMenuOpen()) return;
+    if (!state.switchBox) return;
+    if (state.switchBox.contains(e.target)) return;
+    closePlayerMenu();
+  }, true);
+
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && state.overlay && !state.isMinimized) {
-      removeOverlay();
+    if (e.key === 'Escape') {
+      if (isPlayerMenuOpen()) {
+        closePlayerMenu();
+        return;
+      }
+
+      if (state.overlay && !state.isMinimized) {
+        removeOverlay();
+      }
     }
   });
 
@@ -906,7 +1230,8 @@
     minimizeOverlay,
     restoreOverlay,
     showOverlay,
-    togglePlayerType,
+    togglePlayerMenu,
+    closePlayerMenu,
     setPlayerType,
     getBestVariant,
   };
